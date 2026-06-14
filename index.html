@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>3D VR Slicer Example</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style> body { margin: 0; overflow: hidden; background-color: #000; } </style>
+</head>
+<body>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+  <script type="module">
+
+// --- DIRECT MATCHING CDN IMPORTS ---
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+import { XRButton } from 'https://unpkg.com/three@0.158.0/examples/jsm/webxr/XRButton.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.158.0/examples/jsm/loaders/GLTFLoader.js';
+import * as BufferGeometryUtils from 'https://unpkg.com/three@0.158.0/examples/jsm/utils/BufferGeometryUtils.js';
+
+// --- GAME SETTINGS VARIABLE PANEL ---
+const GAME_SETTINGS = {
+    spawnInterval: 200,       
+    launchSpeedMin: 2.3,      
+    launchSpeedMax: 3.2,      
+    maxSlicesAllowed: 2,      
+    gravity: -2.0,            
+    raycastLength: 2.5,       
+    sliceCooldown: 250,       
+    moveSpeed: 2.5,           
+    
+    useCustomGLB: true,       
+    glbModelPath: '/coin.glb',
+    audioPath: '/slash.wav',       
+    floorTexturePath: '/floor_tile.png',
+
+    // --- CRITICAL CONFIGURATIONS FOR A 4x4 PIXEL IMAGE ---
+    floorTextureScale: 100.0,            // Increased from 40 to 200. This repeats your 4x4 grid much more tightly, keeping the tiles small and sharp.
+    floorTextureUpscaleFilter: 'nearest' // FORCED TO NEAREST: This disables blending and gives you perfectly crisp pixel edges.
+};
+
+let scene, camera, renderer, cameraRig;
+let controllers = [];
+let sliceables = []; 
+let fallingHalves = []; 
+let loadedGLBGeometry = null; 
+let loadedGLBMaterialConfig = null; 
+let debugCanvas, debugTexture, debugMesh;
+
+let audioContext = null;
+let audioBuffer = null;
+
+let staticDummyMesh = null;
+let lastDummyCutTime = 0;
+const DUMMY_RESPAWN_DELAY = 4000; 
+
+const controllerData = new Map();
+const activeSlices = new Map(); 
+let lastSpawnTime = 0;
+let rightStickReleased = true; 
+
+init();
+animate();
+
+function vrLog(message, isError = false) {
+    if (!debugCanvas) return;
+    const ctx = debugCanvas.getContext('2d');
+    ctx.fillStyle = 'rgba(10, 10, 20, 0.9)';
+    ctx.fillRect(0, 0, 512, 256);
+    ctx.strokeStyle = isError ? '#ff0055' : '#00ffcc';
+    ctx.lineWidth = 6;
+    ctx.strokeRect(0, 0, 512, 256);
+    ctx.fillStyle = isError ? '#ff3377' : '#00ffcc';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText(isError ? "[ERROR REPORT]" : "[SYSTEM STATUS]", 20, 40);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '16px monospace';
+    
+    const words = message.toString().split(' ');
+    let line = '';
+    let y = 80;
+    for (let n = 0; n < words.length; n++) {
+        let testLine = line + words[n] + ' ';
+        if (ctx.measureText(testLine).width > 470 && n > 0) {
+            ctx.fillText(line, 20, y);
+            line = words[n] + ' ';
+            y += 24;
+        } else {
+            line = testLine;
+        }
+    }
+    ctx.fillText(line, 20, y);
+    debugTexture.needsUpdate = true;
+}
+
+function init() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a10);
+    scene.fog = new THREE.FogExp2(0x0a0a10, 0.15);
+
+    cameraRig = new THREE.Group();
+    scene.add(cameraRig);
+
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 20);
+    camera.position.set(0, 1.6, 0); 
+    cameraRig.add(camera);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    keyLight.position.set(5, 8, 5);
+    scene.add(keyLight);
+
+    const fillLight = new THREE.DirectionalLight(0x0088ff, 0.3);
+    fillLight.position.set(-5, 4, -5);
+    scene.add(fillLight);
+
+    renderer = new THREE.WebGLRenderer({ 
+        antialias: true, 
+        stencil: true,
+        powerPreference: "high-performance"
+    }); 
+    
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2.0));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    renderer.localClippingEnabled = true; 
+
+    document.body.appendChild(renderer.domElement);
+    document.body.appendChild(XRButton.createButton(renderer));
+
+    debugCanvas = document.createElement('canvas');
+    debugCanvas.width = 512;
+    debugCanvas.height = 256;
+    debugTexture = new THREE.CanvasTexture(debugCanvas);
+    const debugMat = new THREE.MeshBasicMaterial({ map: debugTexture, transparent: true, side: THREE.DoubleSide });
+    debugMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.8, 0.4), debugMat);
+    debugMesh.position.set(0, 2.2, -1.2); 
+    debugMesh.rotateX(0.2); 
+    scene.add(debugMesh);
+    
+    vrLog("Systems active. Pixel-art hardware tuning complete.");
+
+    createDemoFloor();
+    setupControllers();
+    initAudioEngine();
+    
+    if (GAME_SETTINGS.useCustomGLB) {
+        loadGLBAsset();
+    }
+
+    renderer.xr.addEventListener('sessionstart', () => {
+        if (renderer.xr.setFoveation) {
+            renderer.xr.setFoveation(0); 
+        }
+        const session = renderer.xr.getSession();
+        if (session && session.requestViewportScale) {
+            session.requestViewportScale(1.0); 
+        }
+    });
+
+    window.addEventListener('resize', onWindowResize);
+}
+
+function initAudioEngine() {
+    window.addEventListener('click', resumeAudioContext, { once: true });
+    renderer.xr.addEventListener('sessionstart', resumeAudioContext);
+
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    
+    fetch(GAME_SETTINGS.audioPath)
+        .then(response => response.arrayBuffer())
+        .then(buffer => audioContext.decodeAudioData(buffer))
+        .then(decodedData => {
+            audioBuffer = decodedData;
+            vrLog("slash2.wav audio engine loaded.");
+        })
+        .catch(err => vrLog("Audio Load Error: Check asset folder", true));
+}
+
+function resumeAudioContext() {
+    if (audioContext && audioContext.state === 'suspended') {
+        audioContext.resume();
+    }
+}
+
+function playSliceSound() {
+    if (!audioContext || !audioBuffer) return;
+    
+    const soundSource = audioContext.createBufferSource();
+    soundSource.buffer = audioBuffer;
+    soundSource.playbackRate.value = 0.9 + Math.random() * 0.2; 
+    soundSource.connect(audioContext.destination);
+    soundSource.start(0);
+}
+
+function loadGLBAsset() {
+    vrLog(`Parsing model files...`);
+    const loader = new GLTFLoader();
+    
+    loader.load(GAME_SETTINGS.glbModelPath, (gltf) => {
+        let geometriesToMerge = [];
+        
+        gltf.scene.traverse((child) => {
+            if (child.isMesh && child.geometry) {
+                let cleanGeo = child.geometry.clone();
+                child.updateMatrixWorld(true);
+                cleanGeo.applyMatrix4(child.matrixWorld); 
+                geometriesToMerge.push(cleanGeo);
+
+                if (!loadedGLBMaterialConfig && child.material) {
+                    loadedGLBMaterialConfig = {
+                        color: child.material.color ? child.material.color.clone() : new THREE.Color(0xffa500),
+                        map: child.material.map || null,
+                        normalMap: child.material.normalMap || null,
+                        roughnessMap: child.material.roughnessMap || null,
+                        metalnessMap: child.material.metalnessMap || null,
+                        roughness: child.material.roughness !== undefined ? child.material.roughness : 0.4,
+                        metalness: child.material.metalness !== undefined ? child.material.metalness : 0.8
+                    };
+                }
+            }
+        });
+        
+        if (geometriesToMerge.length > 0) {
+            try {
+                if (geometriesToMerge.length > 1) {
+                    loadedGLBGeometry = BufferGeometryUtils.mergeGeometries(geometriesToMerge, true);
+                } else {
+                    loadedGLBGeometry = geometriesToMerge[0];
+                }
+                
+                loadedGLBGeometry.center();
+                loadedGLBGeometry.computeBoundingSphere();
+                const radius = loadedGLBGeometry.boundingSphere.radius;
+                if (radius > 0) {
+                    const scaleFactor = 0.12 / radius; 
+                    loadedGLBGeometry.scale(scaleFactor, scaleFactor, scaleFactor);
+                }
+                vrLog("Sandbox ready. Static dummy spawned!");
+                spawnStaticDummy();
+            } catch (mergeError) {
+                loadedGLBGeometry = geometriesToMerge[0];
+                loadedGLBGeometry.center();
+                vrLog("Fallback geometry container active.");
+            }
+        } else {
+            vrLog("Error: Missing mesh profiles inside GLB.", true);
+        }
+    }, undefined, (err) => {
+        vrLog("GLB Extraction Failure: " + err.message, true);
+    });
+}
+
+function createDemoFloor() {
+    const floorGeo = new THREE.PlaneGeometry(40, 40);
+    floorGeo.rotateX(-Math.PI / 2);
+    
+    const textureLoader = new THREE.TextureLoader();
+    const floorTexture = textureLoader.load(GAME_SETTINGS.floorTexturePath, (tex) => {
+        // Essential for color accuracy
+        tex.colorSpace = THREE.SRGBColorSpace;
+        
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        
+        const repeatCount = GAME_SETTINGS.floorTextureScale;
+        tex.repeat.set(repeatCount, repeatCount); 
+
+        // Set Anisotropic Filtering
+        const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+        tex.anisotropy = maxAnisotropy;
+        
+        // --- HARD CODED ULTRA-SHARP LOW-RES TEXTURE PROPERTIES ---
+        // For 4x4 images, we MUST turn off all linear interpolation (blurring)
+        if (GAME_SETTINGS.floorTextureUpscaleFilter === 'nearest') {
+            tex.magFilter = THREE.NearestFilter;
+            // Use NearestMipmapNearestFilter or switch off mipmaps to preserve block edges at a distance
+            tex.minFilter = THREE.NearestFilter; 
+            tex.generateMipmaps = false; // Prevents the graphics card from auto-blurring it far away
+        } else {
+            tex.magFilter = THREE.LinearFilter;
+            tex.minFilter = THREE.LinearMipmapLinearFilter;
+            tex.generateMipmaps = true;
+        }
+        
+        tex.needsUpdate = true;
+    });
+
+    const floorMat = new THREE.MeshStandardMaterial({ 
+        map: floorTexture, 
+        roughness: 0.8 
+    });
+    
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    scene.add(floor);
+
+    // PRACTICE PEDESTAL
+    const pedGeo = new THREE.CylinderGeometry(0.15, 0.2, 0.9, 16);
+    const pedMat = new THREE.MeshStandardMaterial({ color: 0x222233, roughness: 0.5 });
+    const pedestal = new THREE.Mesh(pedGeo, pedMat);
+    pedestal.position.set(1.0, 0.45, -1.0); 
+    scene.add(pedestal);
+}
+
+function spawnStaticDummy() {
+    if (!loadedGLBGeometry || !loadedGLBMaterialConfig) return;
+
+    const material = new THREE.MeshStandardMaterial({
+        color: loadedGLBMaterialConfig.color,
+        map: loadedGLBMaterialConfig.map,
+        normalMap: loadedGLBMaterialConfig.normalMap,
+        roughnessMap: loadedGLBMaterialConfig.roughnessMap,
+        metalnessMap: loadedGLBMaterialConfig.metalnessMap,
+        roughness: loadedGLBMaterialConfig.roughness,
+        metalness: loadedGLBMaterialConfig.metalness,
+        side: THREE.DoubleSide
+    });
+
+    staticDummyMesh = new THREE.Mesh(loadedGLBGeometry.clone(), material);
+    staticDummyMesh.position.set(1.0, 1.0, -1.0);
+
+    staticDummyMesh.userData = {
+        isSliceable: true,
+        isStaticDummy: true, 
+        sliceCount: 0,
+        lastSliceTime: 0,
+        velocity: new THREE.Vector3(0, 0, 0),
+        rotVelocity: new THREE.Vector3(0, 0.4, 0) 
+    };
+
+    scene.add(staticDummyMesh);
+    sliceables.push(staticDummyMesh);
+}
+
+function setupControllers() {
+    for (let i = 0; i < 2; i++) {
+        const controller = renderer.xr.getController(i);
+        const bladeLength = GAME_SETTINGS.raycastLength; 
+        const bladeGeometry = new THREE.CylinderGeometry(0.002, 0.006, bladeLength, 4);
+        bladeGeometry.rotateX(Math.PI / 2);
+        bladeGeometry.translate(0, 0, -bladeLength / 2); 
+        
+        const bladeMaterial = new THREE.MeshStandardMaterial({
+            color: i === 0 ? 0x00ffcc : 0xff0055,
+            roughness: 0.5
+        });
+        
+        const bladeMesh = new THREE.Mesh(bladeGeometry, bladeMaterial);
+        controller.add(bladeMesh);
+        
+        cameraRig.add(controller);
+        controllers.push(controller);
+
+        controllerData.set(controller, {
+            raycaster: new THREE.Raycaster(),
+            prevPosition: new THREE.Vector3(),
+            currentPosition: new THREE.Vector3(),
+            inputSource: null 
+        });
+
+        controller.addEventListener('selectstart', () => activeSlices.set(controller, true));
+        controller.addEventListener('selectend', () => activeSlices.set(controller, false));
+    }
+
+    renderer.xr.addEventListener('sessionstart', () => {
+        const session = renderer.xr.getSession();
+        session.addEventListener('inputsourceschange', (e) => {
+            const sources = session.inputSources;
+            for (let i = 0; i < sources.length; i++) {
+                if (controllers[i]) {
+                    const data = controllerData.get(controllers[i]);
+                    if (data) data.inputSource = sources[i];
+                }
+            }
+        });
+    });
+}
+
+function handleLocomotion(delta) {
+    controllers.forEach(controller => {
+        const data = controllerData.get(controller);
+        if (!data || !data.inputSource || !data.inputSource.gamepad) return;
+
+        const gamepad = data.inputSource.gamepad;
+        if (gamepad.axes.length >= 4) {
+            
+            if (data.inputSource.handedness === 'left') {
+                const joystickX = gamepad.axes[2]; 
+                const joystickY = gamepad.axes[3]; 
+
+                if (Math.abs(joystickX) > 0.1 || Math.abs(joystickY) > 0.1) {
+                    const headRotation = new THREE.Quaternion();
+                    camera.getWorldQuaternion(headRotation);
+
+                    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(headRotation);
+                    const side = new THREE.Vector3(1, 0, 0).applyQuaternion(headRotation);
+
+                    forward.y = 0;
+                    side.y = 0;
+                    forward.normalize();
+                    side.normalize();
+
+                    const moveVector = new THREE.Vector3()
+                        .addScaledVector(forward, -joystickY * GAME_SETTINGS.moveSpeed * delta)
+                        .addScaledVector(side, joystickX * GAME_SETTINGS.moveSpeed * delta);
+
+                    cameraRig.position.add(moveVector);
+                }
+            }
+
+            if (data.inputSource.handedness === 'right') {
+                const turnX = gamepad.axes[2]; 
+
+                if (Math.abs(turnX) > 0.7) {
+                    if (rightStickReleased) {
+                        const snapAngle = turnX > 0 ? -Math.PI / 4 : Math.PI / 4;
+                        
+                        const headWorldPos = new THREE.Vector3();
+                        camera.getWorldPosition(headWorldPos);
+
+                        cameraRig.position.sub(headWorldPos);
+                        cameraRig.position.applyAxisAngle(new THREE.Vector3(0, 1, 0), snapAngle);
+                        cameraRig.rotateY(snapAngle);
+                        cameraRig.position.add(headWorldPos);
+                        
+                        rightStickReleased = false; 
+                    }
+                } else if (Math.abs(turnX) < 0.3) {
+                    rightStickReleased = true;
+                }
+            }
+        }
+    });
+}
+
+function spawnDemoModel() {
+    let geometry;
+    let material;
+
+    if (GAME_SETTINGS.useCustomGLB && loadedGLBGeometry && loadedGLBMaterialConfig) {
+        geometry = loadedGLBGeometry.clone();
+        material = new THREE.MeshStandardMaterial({
+            color: loadedGLBMaterialConfig.color, map: loadedGLBMaterialConfig.map,
+            normalMap: loadedGLBMaterialConfig.normalMap, roughnessMap: loadedGLBMaterialConfig.roughnessMap,
+            metalnessMap: loadedGLBMaterialConfig.metalnessMap, roughness: loadedGLBMaterialConfig.roughness,
+            metalness: loadedGLBMaterialConfig.metalness, side: THREE.DoubleSide
+        });
+    } else {
+        geometry = new THREE.BoxGeometry(0.2, 0.2, 0.2); 
+        material = new THREE.MeshStandardMaterial({ color: 0xffa500, roughness: 0.4 });
+    }
+
+    const mesh = new THREE.Mesh(geometry, material);
+    const launchX = (Math.random() - 0.5) * 0.6;
+    mesh.position.set(launchX, 0.1, -1.4); 
+    
+    const calculatedLaunchVelocityY = Math.random() * (GAME_SETTINGS.launchSpeedMax - GAME_SETTINGS.launchSpeedMin) + GAME_SETTINGS.launchSpeedMin;
+
+    mesh.userData = {
+        isSliceable: true,
+        isStaticDummy: false,
+        sliceCount: 0, 
+        lastSliceTime: 0, 
+        velocity: new THREE.Vector3(-launchX * 0.3, calculatedLaunchVelocityY, 0),
+        gravity: GAME_SETTINGS.gravity,
+        rotVelocity: new THREE.Vector3(Math.random() * 2, Math.random() * 2, Math.random() * 2)
+    };
+
+    scene.add(mesh);
+    sliceables.push(mesh);
+}
+
+function animate() {
+    renderer.setAnimationLoop(render);
+}
+
+function render(time, frame) {
+    try {
+        const delta = 0.016; 
+
+        handleLocomotion(delta);
+
+        if (!staticDummyMesh && time - lastDummyCutTime > DUMMY_RESPAWN_DELAY) {
+            spawnStaticDummy();
+        }
+
+        if (time - lastSpawnTime > GAME_SETTINGS.spawnInterval) {
+            spawnDemoModel();
+            lastSpawnTime = time;
+        }
+
+        for (let i = sliceables.length - 1; i >= 0; i--) {
+            const target = sliceables[i];
+            
+            if (target.userData.isStaticDummy) {
+                target.rotateY(target.userData.rotVelocity.y * delta);
+            } else {
+                target.userData.velocity.y += target.userData.gravity * delta;
+                target.position.addScaledVector(target.userData.velocity, delta);
+                target.rotateX(target.userData.rotVelocity.x * delta);
+                target.rotateY(target.userData.rotVelocity.y * delta);
+                
+                if (target.position.y < -0.5) {
+                    scene.remove(target);
+                    sliceables.splice(i, 1);
+                }
+            }
+        }
+
+        for (let i = fallingHalves.length - 1; i >= 0; i--) {
+            const halfGroup = fallingHalves[i]; 
+            halfGroup.userData.velocity.y += halfGroup.userData.gravity * delta;
+            halfGroup.position.addScaledVector(halfGroup.userData.velocity, delta);
+            
+            halfGroup.children.forEach(child => {
+                if (child.material && child.material.clippingPlanes && child.userData && child.userData.localClipPlanes) {
+                    child.updateMatrixWorld();
+                    child.material.clippingPlanes.forEach((plane, pIdx) => {
+                        if (child.userData.localClipPlanes[pIdx]) {
+                            plane.copy(child.userData.localClipPlanes[pIdx]).applyMatrix4(child.matrixWorld);
+                        }
+                    });
+                }
+            });
+
+            if (halfGroup.position.y < -0.5) {
+                scene.remove(halfGroup);
+                fallingHalves.splice(i, 1);
+            }
+        }
+
+        executeRaycastSlicing(time);
+        renderer.render(scene, camera);
+    } catch (renderError) {
+        vrLog(renderError.message, true);
+    }
+}
+
+function executeRaycastSlicing(currentTime) {
+    controllers.forEach(controller => {
+        const data = controllerData.get(controller);
+        if (!data) return;
+
+        data.prevPosition.copy(data.currentPosition);
+        controller.getWorldPosition(data.currentPosition);
+
+        if (activeSlices.get(controller) !== true) return;
+
+        const rayOrigin = new THREE.Vector3();
+        const rayDirection = new THREE.Vector3(0, 0, -1);
+        
+        controller.getWorldPosition(rayOrigin);
+        
+        const controllerWorldQuaternion = new THREE.Quaternion();
+        controller.getWorldQuaternion(controllerWorldQuaternion);
+        rayDirection.applyQuaternion(controllerWorldQuaternion).normalize();
+        
+        data.raycaster.set(rayOrigin, rayDirection);
+        data.raycaster.far = GAME_SETTINGS.raycastLength; 
+
+        const sliceTargets = [...sliceables, ...fallingHalves.filter(h => h.userData.sliceCount < GAME_SETTINGS.maxSlicesAllowed)];
+        const intersects = data.raycaster.intersectObjects(sliceTargets, true);
+
+        if (intersects.length > 0) {
+            const hit = intersects[0];
+            let structuralTarget = hit.object;
+            while (structuralTarget.parent && structuralTarget.parent !== scene) {
+                structuralTarget = structuralTarget.parent;
+            }
+
+            if (currentTime - (structuralTarget.userData.lastSliceTime || 0) < GAME_SETTINGS.sliceCooldown) return;
+            if (structuralTarget.userData.sliceCount >= GAME_SETTINGS.maxSlicesAllowed) return;
+
+            structuralTarget.userData.lastSliceTime = currentTime; 
+            
+            const worldPlaneNormal = new THREE.Vector3(0, 1, 0); 
+            const bladeMotion = new THREE.Vector3().subVectors(data.currentPosition, data.prevPosition);
+            if (bladeMotion.lengthSq() > 0.00001) {
+                const crossNormal = new THREE.Vector3().crossVectors(bladeMotion.clone().normalize(), rayDirection).normalize();
+                if (crossNormal.lengthSq() > 0) worldPlaneNormal.copy(crossNormal);
+            }
+
+            if (structuralTarget.userData.isStaticDummy) {
+                staticDummyMesh = null;
+                lastDummyCutTime = currentTime;
+            }
+
+            sliceMesh(structuralTarget, hit.point, worldPlaneNormal, currentTime);
+        }
+    });
+}
+
+function createHardwareStencilCapMesh(plane, color) {
+    const capGeo = new THREE.PlaneGeometry(2, 2); 
+    const capMat = new THREE.MeshStandardMaterial({
+        color: color, roughness: 0.4, metalness: 0.8, side: THREE.DoubleSide, clippingPlanes: [plane],
+        stencilWrite: true, stencilRef: 0, stencilFunc: THREE.NotEqualStencilFunc,
+        stencilFail: THREE.KeepStencilOp, stencilZFail: THREE.KeepStencilOp, stencilZPass: THREE.KeepStencilOp
+    });
+    return new THREE.Mesh(capGeo, capMat);
+}
+
+function sliceMesh(target, planePoint, planeNormal, currentTime) {
+    try {
+        const cleanIndex = sliceables.indexOf(target);
+        if (cleanIndex > -1) sliceables.splice(cleanIndex, 1);
+        
+        const halfIndex = fallingHalves.indexOf(target);
+        if (halfIndex > -1) fallingHalves.splice(halfIndex, 1);
+        
+        scene.remove(target);
+        target.updateMatrixWorld();
+        
+        const currentGeneration = target.userData.sliceCount || 0;
+        const nextGeneration = currentGeneration + 1;
+
+        const globalPlane1 = new THREE.Plane().setFromNormalAndCoplanarPoint(planeNormal, planePoint);
+        const globalPlane2 = new THREE.Plane().setFromNormalAndCoplanarPoint(planeNormal.clone().negate(), planePoint);
+        const globalPlanes = [globalPlane1, globalPlane2];
+
+        playSliceSound();
+
+        for (let i = 0; i < 2; i++) {
+            const sign = i === 0 ? 1 : -1;
+            
+            const halfGroup = new THREE.Group();
+            halfGroup.position.copy(target.position);
+            halfGroup.quaternion.copy(target.quaternion);
+            halfGroup.scale.copy(target.scale);
+            halfGroup.updateMatrixWorld();
+
+            const activeRenderPlane = globalPlanes[i].clone();
+            let existingPlanes = [];
+            let existingLocalBlueprints = [];
+            
+            let sourceMesh = target;
+            if (target.isGroup) {
+                sourceMesh = target.children.find(c => c.isMesh) || target.children[0];
+            }
+            
+            if (!sourceMesh || !sourceMesh.geometry) return;
+
+            if (sourceMesh.material && sourceMesh.material.clippingPlanes) {
+                existingPlanes = [...sourceMesh.material.clippingPlanes];
+                if (sourceMesh.userData && sourceMesh.userData.localClipPlanes) {
+                    existingLocalBlueprints = [...sourceMesh.userData.localClipPlanes];
+                }
+            }
+            
+            const accumulatedPlanes = [activeRenderPlane, ...existingPlanes];
+            const halfGeom = sourceMesh.geometry.clone();
+
+            const groupInvertedMatrix = new THREE.Matrix4().copy(halfGroup.matrixWorld).invert();
+            const currentLocalBlueprint = globalPlanes[i].clone().applyMatrix4(groupInvertedMatrix);
+            const fullBlueprintArray = [currentLocalBlueprint, ...existingLocalBlueprints];
+
+            const mColor = loadedGLBMaterialConfig ? loadedGLBMaterialConfig.color : new THREE.Color(0xffa500);
+            const mMap = loadedGLBMaterialConfig ? loadedGLBMaterialConfig.map : null;
+            const mNormal = loadedGLBMaterialConfig ? loadedGLBMaterialConfig.normalMap : null;
+            const mRoughnessMap = loadedGLBMaterialConfig ? loadedGLBMaterialConfig.roughnessMap : null;
+            const mMetalnessMap = loadedGLBMaterialConfig ? loadedGLBMaterialConfig.metalnessMap : null;
+            const mRoughness = loadedGLBMaterialConfig ? loadedGLBMaterialConfig.roughness : 0.4;
+            const mMetalness = loadedGLBMaterialConfig ? loadedGLBMaterialConfig.metalness : 0.8;
+
+            const matBack = new THREE.MeshStandardMaterial({
+                color: mColor, map: mMap, normalMap: mNormal, roughnessMap: mRoughnessMap, metalnessMap: mMetalnessMap,
+                clippingPlanes: accumulatedPlanes, side: THREE.BackSide, colorWrite: false, depthWrite: false, stencilWrite: true,
+                stencilFunc: THREE.AlwaysStencilFunc, stencilFail: THREE.KeepStencilOp, stencilZFail: THREE.IncrementWrapStencilOp, stencilZPass: THREE.KeepStencilOp
+            });
+            const meshBack = new THREE.Mesh(halfGeom, matBack);
+            meshBack.userData.localClipPlanes = fullBlueprintArray;
+            halfGroup.add(meshBack);
+
+            const matFront = new THREE.MeshStandardMaterial({
+                color: mColor, map: mMap, normalMap: mNormal, roughnessMap: mRoughnessMap, metalnessMap: mMetalnessMap,
+                clippingPlanes: accumulatedPlanes, side: THREE.FrontSide, colorWrite: false, depthWrite: false, stencilWrite: true,
+                stencilFunc: THREE.AlwaysStencilFunc, stencilFail: THREE.KeepStencilOp, stencilZFail: THREE.DecrementWrapStencilOp, stencilZPass: THREE.KeepStencilOp
+            });
+            const meshFront = new THREE.Mesh(halfGeom, matFront);
+            meshFront.userData.localClipPlanes = fullBlueprintArray;
+            halfGroup.add(meshFront);
+
+            const halfMat = new THREE.MeshStandardMaterial({
+                color: mColor, map: mMap, normalMap: mNormal, roughnessMap: mRoughnessMap, metalnessMap: mMetalnessMap,
+                roughness: mRoughness, metalness: mMetalness, side: THREE.DoubleSide, clippingPlanes: accumulatedPlanes
+            });
+            const halfMesh = new THREE.Mesh(halfGeom, halfMat);
+            halfMesh.userData.localClipPlanes = fullBlueprintArray;
+            halfGroup.add(halfMesh);
+
+            const capMesh = createHardwareStencilCapMesh(activeRenderPlane, 0xd4af37);
+            const invertedWorldMatrix = new THREE.Matrix4().copy(target.matrixWorld).invert();
+            const localPlanePoint = planePoint.clone().applyMatrix4(invertedWorldMatrix);
+            const localPlaneNormal = planeNormal.clone().transformDirection(invertedWorldMatrix).normalize();
+            
+            capMesh.position.copy(localPlanePoint);
+            capMesh.lookAt(localPlanePoint.clone().add(localPlaneNormal));
+            capMesh.userData.localClipPlanes = fullBlueprintArray;
+            halfGroup.add(capMesh);
+
+            let baseVelocity = target.userData.velocity ? target.userData.velocity.clone() : new THREE.Vector3(0, 0, 0);
+            if (target.userData.isStaticDummy) {
+                baseVelocity.set(0, 1.2, 0); 
+            }
+            
+            halfGroup.userData = {
+                sliceCount: nextGeneration, 
+                lastSliceTime: currentTime, 
+                velocity: baseVelocity.addScaledVector(planeNormal, sign * 1.5).setY(baseVelocity.y * 0.75),
+                gravity: GAME_SETTINGS.gravity,
+                rotVelocity: new THREE.Vector3(Math.random() * 3 - 1.5, Math.random() * 3 - 1.5, Math.random() * 3 - 1.5)
+            };
+
+            scene.add(halfGroup);
+            fallingHalves.push(halfGroup);
+        }
+    } catch (sliceError) {
+        vrLog("Patch composition error: " + sliceError.message, true);
+    }
+}
+
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+  </script>
+</body>
+</html>
